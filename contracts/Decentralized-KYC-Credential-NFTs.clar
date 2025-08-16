@@ -281,3 +281,72 @@
       original-verifier: (get verifier credential),
       mint-block: (get block-height (unwrap! mint-event err-not-found))
     })))
+
+(define-map credential-verifications
+  { token-id: uint, verifier: principal }
+  { count: uint, last-verified: uint }
+)
+
+(define-map credential-scores uint uint)
+
+(define-map credential-verifier-count uint uint)
+
+(define-data-var score-decay-factor uint u95)
+
+(define-public (verify-credential (token-id uint))
+  (let 
+    (
+      (credential (unwrap! (map-get? credential-data token-id) err-not-found))
+      (verifier tx-sender)
+      (current-verification (default-to { count: u0, last-verified: u0 } 
+        (map-get? credential-verifications { token-id: token-id, verifier: verifier })))
+    )
+    (asserts! (is-eq (get status credential) "active") err-invalid-status)
+    (asserts! (> (get expiry credential) burn-block-height) err-expired)
+    (asserts! (not (is-eq verifier (get verifier credential))) err-not-authorized)
+    
+    (map-set credential-verifications 
+      { token-id: token-id, verifier: verifier }
+      { 
+        count: (+ (get count current-verification) u1), 
+        last-verified: burn-block-height 
+      }
+    )
+    
+    (if (is-eq (get count current-verification) u0)
+      (map-set credential-verifier-count token-id 
+        (+ (default-to u0 (map-get? credential-verifier-count token-id)) u1))
+      true)
+    
+    (let ((new-score (calculate-verification-score token-id)))
+      (map-set credential-scores token-id new-score)
+      (ok new-score))))
+
+(define-private (calculate-verification-score (token-id uint))
+  (let 
+    (
+      (credential (unwrap-panic (map-get? credential-data token-id)))
+      (verifier-count (default-to u0 (map-get? credential-verifier-count token-id)))
+      (age-in-blocks (- burn-block-height (get expiry credential)))
+      (base-score (* verifier-count u100))
+      (time-factor (if (> age-in-blocks u0) 
+        (/ (* (var-get score-decay-factor) u100) u100) 
+        u100))
+    )
+    (/ (* base-score time-factor) u100)))
+
+(define-read-only (get-credential-score (token-id uint))
+  (default-to u0 (map-get? credential-scores token-id)))
+
+(define-read-only (get-verification-details (token-id uint) (verifier principal))
+  (map-get? credential-verifications { token-id: token-id, verifier: verifier }))
+
+(define-read-only (get-verifier-count (token-id uint))
+  (default-to u0 (map-get? credential-verifier-count token-id)))
+
+(define-public (set-score-decay-factor (new-factor uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (and (>= new-factor u50) (<= new-factor u100)) err-invalid-status)
+    (var-set score-decay-factor new-factor)
+    (ok true)))
