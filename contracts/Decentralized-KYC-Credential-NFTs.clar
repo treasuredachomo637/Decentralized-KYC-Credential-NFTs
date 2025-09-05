@@ -350,3 +350,149 @@
     (asserts! (and (>= new-factor u50) (<= new-factor u100)) err-invalid-status)
     (var-set score-decay-factor new-factor)
     (ok true)))
+
+(define-constant err-insufficient-payment (err u106))
+(define-constant err-request-not-found (err u107))
+(define-constant err-request-expired (err u108))
+(define-constant err-already-fulfilled (err u109))
+(define-constant err-invalid-listing (err u110))
+
+(define-data-var next-request-id uint u1)
+
+(define-map verification-requests
+  uint
+  {
+    requester: principal,
+    credential-level: uint,
+    payment-amount: uint,
+    expiry-block: uint,
+    status: (string-ascii 20),
+    selected-credential: (optional uint)
+  }
+)
+
+(define-map credential-listings
+  { token-id: uint, request-id: uint }
+  {
+    price: uint,
+    available: bool
+  }
+)
+
+(define-map marketplace-earnings principal uint)
+
+(define-public (create-verification-request (credential-level uint) (payment-amount uint) (duration-blocks uint))
+  (let 
+    (
+      (request-id (var-get next-request-id))
+      (expiry-block (+ burn-block-height duration-blocks))
+    )
+    (try! (stx-transfer? payment-amount tx-sender (as-contract tx-sender)))
+    (map-set verification-requests request-id
+      {
+        requester: tx-sender,
+        credential-level: credential-level,
+        payment-amount: payment-amount,
+        expiry-block: expiry-block,
+        status: "active",
+        selected-credential: none
+      }
+    )
+    (var-set next-request-id (+ request-id u1))
+    (ok request-id)))
+
+(define-public (list-credential-for-request (token-id uint) (request-id uint) (price uint))
+  (let 
+    (
+      (credential (unwrap! (map-get? credential-data token-id) err-not-found))
+      (request (unwrap! (map-get? verification-requests request-id) err-request-not-found))
+      (token-owner (unwrap! (nft-get-owner? kyc-credential token-id) err-not-found))
+    )
+    (asserts! (is-eq tx-sender token-owner) err-not-authorized)
+    (asserts! (is-eq (get status credential) "active") err-invalid-status)
+    (asserts! (>= (get level credential) (get credential-level request)) err-invalid-listing)
+    (asserts! (is-eq (get status request) "active") err-invalid-status)
+    (asserts! (> (get expiry-block request) burn-block-height) err-request-expired)
+    (asserts! (<= price (get payment-amount request)) err-insufficient-payment)
+    
+    (map-set credential-listings { token-id: token-id, request-id: request-id }
+      {
+        price: price,
+        available: true
+      }
+    )
+    (ok true)))
+
+(define-public (select-credential-for-verification (request-id uint) (token-id uint))
+  (let 
+    (
+      (request (unwrap! (map-get? verification-requests request-id) err-request-not-found))
+      (listing (unwrap! (map-get? credential-listings { token-id: token-id, request-id: request-id }) err-not-found))
+      (credential (unwrap! (map-get? credential-data token-id) err-not-found))
+      (token-owner (unwrap! (nft-get-owner? kyc-credential token-id) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get requester request)) err-not-authorized)
+    (asserts! (is-eq (get status request) "active") err-invalid-status)
+    (asserts! (> (get expiry-block request) burn-block-height) err-request-expired)
+    (asserts! (get available listing) err-invalid-listing)
+    
+    (try! (as-contract (stx-transfer? (get price listing) tx-sender token-owner)))
+    
+    (map-set verification-requests request-id
+      (merge request 
+        {
+          status: "fulfilled",
+          selected-credential: (some token-id)
+        }
+      )
+    )
+    
+    (map-set credential-listings { token-id: token-id, request-id: request-id }
+      (merge listing { available: false }))
+    
+    (map-set marketplace-earnings token-owner
+      (+ (default-to u0 (map-get? marketplace-earnings token-owner)) (get price listing)))
+    
+    (ok true)))
+
+(define-public (cancel-verification-request (request-id uint))
+  (let ((request (unwrap! (map-get? verification-requests request-id) err-request-not-found)))
+    (asserts! (is-eq tx-sender (get requester request)) err-not-authorized)
+    (asserts! (is-eq (get status request) "active") err-invalid-status)
+    
+    (try! (as-contract (stx-transfer? (get payment-amount request) tx-sender (get requester request))))
+    
+    (map-set verification-requests request-id
+      (merge request { status: "cancelled" }))
+    (ok true)))
+
+(define-public (withdraw-expired-request (request-id uint))
+  (let ((request (unwrap! (map-get? verification-requests request-id) err-request-not-found)))
+    (asserts! (is-eq tx-sender (get requester request)) err-not-authorized)
+    (asserts! (is-eq (get status request) "active") err-invalid-status)
+    (asserts! (<= (get expiry-block request) burn-block-height) err-request-expired)
+    
+    (try! (as-contract (stx-transfer? (get payment-amount request) tx-sender (get requester request))))
+    
+    (map-set verification-requests request-id
+      (merge request { status: "expired" }))
+    (ok true)))
+
+(define-read-only (get-verification-request (request-id uint))
+  (map-get? verification-requests request-id))
+
+(define-read-only (get-credential-listing (token-id uint) (request-id uint))
+  (map-get? credential-listings { token-id: token-id, request-id: request-id }))
+
+(define-read-only (get-marketplace-earnings (user principal))
+  (default-to u0 (map-get? marketplace-earnings user)))
+
+(define-read-only (get-active-requests-count)
+  (var-get next-request-id))
+
+(define-read-only (is-request-active (request-id uint))
+  (match (map-get? verification-requests request-id)
+    request (and 
+      (is-eq (get status request) "active")
+      (> (get expiry-block request) burn-block-height))
+    false))
