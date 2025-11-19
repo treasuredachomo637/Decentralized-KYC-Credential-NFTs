@@ -24,12 +24,15 @@
 (define-constant err-invalid-analytics-params (err u201))
 (define-constant err-analytics-overflow (err u202))
 (define-constant err-insufficient-data (err u203))
+(define-constant err-invalid-tier (err u204))
+(define-constant err-tier-not-unlocked (err u205))
 
 ;; Data variables
 (define-data-var next-id uint u1)
 (define-data-var verifier-address principal contract-owner)
 (define-data-var analytics-enabled bool true)
 (define-data-var analytics-cache-duration uint u1000)
+(define-data-var reward-tiers-enabled bool true)
 
 ;; Core data structures
 (define-map credential-data
@@ -115,6 +118,82 @@
   }
 )
 
+(define-map user-reward-tier
+  principal
+  {
+    total-credentials-earned: uint,
+    current-tier: uint,
+    tier-unlocked-at: uint,
+    lifetime-level-sum: uint,
+    badges-earned: (list 5 uint)
+  }
+)
+
+(define-map reward-tier-config
+  uint
+  {
+    tier-name: (string-ascii 20),
+    credentials-required: uint,
+    level-sum-required: uint,
+    tier-badge-id: uint,
+    tier-benefits: (string-ascii 50)
+  }
+)
+
+;; =====================================
+;; REWARD TIER INITIALIZATION
+;; =====================================
+
+(map-set reward-tier-config u1
+  {
+    tier-name: "Bronze Verified",
+    credentials-required: u1,
+    level-sum-required: u0,
+    tier-badge-id: u101,
+    tier-benefits: "Basic verification access"
+  }
+)
+
+(map-set reward-tier-config u2
+  {
+    tier-name: "Silver Verified",
+    credentials-required: u5,
+    level-sum-required: u10,
+    tier-badge-id: u102,
+    tier-benefits: "Enhanced verification priority"
+  }
+)
+
+(map-set reward-tier-config u3
+  {
+    tier-name: "Gold Verified",
+    credentials-required: u15,
+    level-sum-required: u35,
+    tier-badge-id: u103,
+    tier-benefits: "Premium verification & discounts"
+  }
+)
+
+(map-set reward-tier-config u4
+  {
+    tier-name: "Platinum Elite",
+    credentials-required: u30,
+    level-sum-required: u80,
+    tier-badge-id: u104,
+    tier-benefits: "VIP status & exclusive benefits"
+  }
+)
+
+(map-set reward-tier-config u5
+  {
+    tier-name: "Diamond Legend",
+    credentials-required: u50,
+    level-sum-required: u150,
+    tier-badge-id: u105,
+    tier-benefits: "Legendary status & max benefits"
+  }
+)
+
 ;; =====================================
 ;; CORE CONTRACT FUNCTIONS
 ;; =====================================
@@ -156,6 +235,11 @@
         (unwrap-panic (update-verifier-analytics verifier))
         (unwrap-panic (update-credential-level-analytics level))
         (unwrap-panic (update-user-analytics recipient level)))
+      true)
+    
+    ;; Update reward tier
+    (if (var-get reward-tiers-enabled)
+      (unwrap-panic (update-user-reward-tier recipient level))
       true)
     
     (ok token-id)))
@@ -398,15 +482,15 @@
       growth-rate: (calculate-growth-rate start-block current-block)
     })))
 
-(define-read-only (get-analytics-health-check))
-  {
+(define-read-only (get-analytics-health-check)
+  (ok {
     cache-hit-rate: u92,
     data-freshness: (- burn-block-height u5),
     calculation-accuracy: u98,
     system-load: u35,
     analytics-enabled: (var-get analytics-enabled),
     recommendations: "System operating optimally"
-  })
+  }))
 
 (define-read-only (get-top-performing-verifiers (limit uint))
   (ok {
@@ -501,3 +585,110 @@
     (asserts! (and (>= cache-duration u100) (<= cache-duration u10000)) err-invalid-analytics-params)
     (var-set analytics-cache-duration cache-duration)
     (ok true)))
+
+;; =====================================
+;; REWARD TIER FUNCTIONS
+;; =====================================
+
+(define-public (update-user-reward-tier (user principal) (credential-level uint))
+  (let
+    (
+      (current-tier-data (default-to
+        { total-credentials-earned: u0, current-tier: u0, tier-unlocked-at: u0, lifetime-level-sum: u0, badges-earned: (list) }
+        (map-get? user-reward-tier user)))
+      (new-total (+ (get total-credentials-earned current-tier-data) u1))
+      (new-level-sum (+ (get lifetime-level-sum current-tier-data) credential-level))
+      (new-tier (calculate-user-tier new-total new-level-sum))
+      (current-tier (get current-tier current-tier-data))
+    )
+    (map-set user-reward-tier user
+      (merge current-tier-data
+        {
+          total-credentials-earned: new-total,
+          lifetime-level-sum: new-level-sum,
+          current-tier: new-tier,
+          tier-unlocked-at: (if (> new-tier current-tier) burn-block-height (get tier-unlocked-at current-tier-data)),
+          badges-earned: (if (> new-tier current-tier) 
+            (unwrap-panic (as-max-len? (append (get badges-earned current-tier-data) new-tier) u5))
+            (get badges-earned current-tier-data))
+        }
+      )
+    )
+    (ok true)))
+
+(define-public (claim-tier-badge (tier-id uint))
+  (let
+    (
+      (user tx-sender)
+      (user-tier-data (unwrap! (map-get? user-reward-tier user) err-not-found))
+      (current-tier (get current-tier user-tier-data))
+    )
+    (asserts! (and (>= tier-id u1) (<= tier-id u5)) err-invalid-tier)
+    (asserts! (>= current-tier tier-id) err-tier-not-unlocked)
+    (ok { tier: tier-id, badge-claimed: true, user: user })))
+
+(define-read-only (get-user-reward-tier (user principal))
+  (map-get? user-reward-tier user))
+
+(define-read-only (get-tier-config (tier-id uint))
+  (map-get? reward-tier-config tier-id))
+
+(define-read-only (get-user-tier-progress (user principal))
+  (let
+    (
+      (user-tier-data (default-to
+        { total-credentials-earned: u0, current-tier: u0, tier-unlocked-at: u0, lifetime-level-sum: u0, badges-earned: (list) }
+        (map-get? user-reward-tier user)))
+      (current-tier (get current-tier user-tier-data))
+      (next-tier (+ current-tier u1))
+      (next-tier-config (map-get? reward-tier-config next-tier))
+    )
+    (if (and (<= current-tier u4) (is-some next-tier-config))
+      (let
+        (
+          (tier-config (unwrap-panic next-tier-config))
+          (creds-needed (- (get credentials-required tier-config) (get total-credentials-earned user-tier-data)))
+          (level-sum-needed (- (get level-sum-required tier-config) (get lifetime-level-sum user-tier-data)))
+        )
+        (ok {
+          current-tier: current-tier,
+          next-tier: next-tier,
+          credentials-needed: creds-needed,
+          level-sum-needed: level-sum-needed,
+          progress-percent: (/ (* (get total-credentials-earned user-tier-data) u100) (get credentials-required tier-config))
+        }))
+      (ok {
+        current-tier: current-tier,
+        next-tier: u0,
+        credentials-needed: u0,
+        level-sum-needed: u0,
+        progress-percent: u100
+      }))))
+
+(define-read-only (get-all-tier-configs)
+  (ok {
+    tier-1: (unwrap-panic (map-get? reward-tier-config u1)),
+    tier-2: (unwrap-panic (map-get? reward-tier-config u2)),
+    tier-3: (unwrap-panic (map-get? reward-tier-config u3)),
+    tier-4: (unwrap-panic (map-get? reward-tier-config u4)),
+    tier-5: (unwrap-panic (map-get? reward-tier-config u5))
+  }))
+
+(define-public (toggle-reward-tiers (enabled bool))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set reward-tiers-enabled enabled)
+    (ok true)))
+
+(define-private (calculate-user-tier (total-credentials uint) (level-sum uint))
+  (if (and (>= total-credentials u50) (>= level-sum u150))
+    u5
+    (if (and (>= total-credentials u30) (>= level-sum u80))
+      u4
+      (if (and (>= total-credentials u15) (>= level-sum u35))
+        u3
+        (if (and (>= total-credentials u5) (>= level-sum u10))
+          u2
+          (if (>= total-credentials u1)
+            u1
+            u0))))))
